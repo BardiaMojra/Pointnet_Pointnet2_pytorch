@@ -1,0 +1,10 @@
+# Dataset, weights, run logs and figures stay local (general_rules §4); code and reports are tracked.
+# The figures are published, captioned, in dlo_data_001/dev/dev_figs/ (smerx, 2026-09-14).
+data/
+checkpoints/
+models/*.pth
+logs/
+figs/
+*.png
+*.pdf
+__pycache__/
