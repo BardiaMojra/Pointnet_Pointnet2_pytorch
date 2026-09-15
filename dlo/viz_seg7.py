@@ -178,8 +178,102 @@ def render_pair(xyz, lab, pred, title, out_png, box, label_note="label"):
     return V.render7(xyz, [(label_note, lab), ("prediction", pred)], title, out_png, box)
 
 
+def grip_overlap(run="r03", half=0.15):
+    """data/grip_overlap/ (grip_overlap7.py) -> per frame, zoomed +-half m around the detected marker: labels
+    under the r02 gripper rule (upper row) and the r03 rule (lower row) -> dev_figs/v036-pn2-<run>_01_*.png."""
+    import json
+    d = os.path.join(V.HERE, "data", "grip_overlap")
+    with open(os.path.join(d, "stats.json")) as f:
+        stats = json.load(f)
+    outs = []
+    for st in stats:
+        z = np.load(os.path.join(d, "%s_f%06d.npz" % (st["ep"], st["frame"])))
+        mk = z["marker"].astype(np.float64)
+        box = [mk[0] - half, mk[0] + half, mk[1] - half, mk[1] + half, mk[2] - half, mk[2] + half]
+        xyz = z["xyz"].astype(np.float64)
+        w = np.all((xyz > [box[0], box[2], box[4]]) & (xyz < [box[1], box[3], box[5]]), axis=1)
+        dlo = st["batch"][:4]
+        src = V.render7(xyz[w], [("r02 rule (FK capsule)", z["lab_fk"][w]),
+                                 ("r03 rule (whole gripper)", z["lab_body"][w])],
+                        "%s frame %d | +-%.0f cm around the detected gripper marker" % (st["ep"], st["frame"], 100 * half),
+                        os.path.join(V.FIG_DIR, "grip_overlap_%s_f%06d.png" % (st["ep"], st["frame"])), box)
+        b, f = st["body"], st["fk"]
+        body = ("Preview of the r03 gripper class where the rope's gripper end (tied to the left finger, green tape) "
+                "meets the gripper, %s, same frame and same v034 node path under both rules; points within %.0f cm of "
+                "the detected gripper marker (the marker as logged per frame, lee_cam), coloured by class. Upper row, "
+                "r02: gripper = FK capsule (3 cm radius) + red points near the FK marker: %d gripper points. Lower "
+                "row, r03: gripper = points within 10 cm of the detected marker that are saturated cyan/blue (hue "
+                "180-225, saturation > 50; %s), or in the gripper's static voxels in the marker frame (8 mm voxels "
+                "occupied in >= 50%% of 20 frames, FK orientation), or red within 8 cm (the right finger): %d gripper "
+                "points (colour %d, static voxels %d, of them %d by static voxels alone, red %d). Rope first: the "
+                "rope classes come from the node path before any gripper region, so the %d rope-gripper-end points "
+                "(r02 rule: %d) include %d inside the r03 gripper region that stay rope; rope points identical under "
+                "both rules: %s." % (
+                    dlo, 100 * half, f["n_c3"], "not used for d004, whose cable is blue" if dlo == "d004" else "d001-d003",
+                    b["n_c3"], b["c3_col"], b["c3_static"], b["c3_static_only"], b["c3_red_finger"], b["n_c2"], f["n_c2"],
+                    b["c2_in_grip_region"], "yes" if st["rope_unchanged"] else "no"))
+        outs.append(publish(src, run, 1, "gripper_rope_end_overlap_%s_%s_f%06d" % (dlo, st["ep"], st["frame"]),
+                            "v036 PointNet++ r03 label preview: rope gripper end vs left finger, %s, %s frame %d"
+                            % (dlo, st["ep"], st["frame"]), body))
+    return outs
+
+
+def loop_case(run="r02", sub="loop_case", harness=None):
+    """data/<sub>/ (grip_overlap7.py --frames ... --out_dir data/<sub>) -> per frame: the v034-derived label under
+    r02's rules vs run's own 7-class prediction on the whole workspace box, harness numbers from it23_r02
+    -> dev_figs/v036-pn2-<run>_08_d003_loop_<ep>_f<frame>.png."""
+    import json
+    import torch
+    import dlo_data
+    import eval_seg7 as E                      # its predict(); imported here (eval_seg7 imports this module)
+    import pn2_dlo
+    d = os.path.join(V.HERE, "data", sub)
+    with open(os.path.join(d, "stats.json")) as f:
+        stats = json.load(f)
+    harness = harness or os.path.expanduser("~/git/dlo_data_001/dev/studies/gt_ablation_v035/runs/it23_r02/frames.csv")
+    with open(harness) as f:
+        hz = {(r["episode"], int(r["frame"])): r for r in csv.DictReader(f)}
+    ck = torch.load(os.path.join(V.HERE, "checkpoints", run, "best.pth"), map_location="cuda", weights_only=False)
+    cfg = ck["cfg"]
+    pn2_dlo.SAMPLING["random_min"] = cfg["random_min"]
+    model = pn2_dlo.get_model(num_classes=cfg["classes"]).cuda()
+    model.load_state_dict(ck["model"])
+    model.eval()
+    center, box = np.asarray(cfg["center"]), cfg["box"]
+    outs = []
+    for i, st in enumerate(stats):
+        z = np.load(os.path.join(d, "%s_f%06d.npz" % (st["ep"], st["frame"])))
+        xyz, rgb, lab = z["xyz"].astype(np.float64), z["rgb"], z["lab_fk"]
+        pred = E.predict(model, z["xyz"], rgb, center, cfg["n_points"], 700 + i, True)[0]
+        rl, rp = np.isin(lab, (1, 2, 5)), np.isin(pred, (1, 2, 5))
+        h = hz.get((st["ep"], st["frame"]), {})
+        g = lambda k: h.get(k, "") or "n/a"
+        src = V.render7(xyz, [("label: v034 node path, r02 rules", lab), ("%s prediction" % run, pred)],
+                        "%s frame %d | rope pts label %d, prediction %d (%d predicted rope outside the label)" % (
+                            st["ep"], st["frame"], rl.sum(), rp.sum(), (rp & ~rl).sum()),
+                        os.path.join(V.FIG_DIR, "%s_loop_%s_f%06d.png" % (run, st["ep"], st["frame"])), box)
+        body = ("d003 frame the v034 pipeline flagged (%s %s) where the harness replay (it23_r02) of segmentation on r02's crops "
+                "still fails. Upper row: the label r02 was trained with on clean frames (rope = within eps of v034's node "
+                "path), here rebuilt for this frame from its v034 node path; lower row: r02's 7-class prediction on the "
+                "whole workspace box (argmax, 1-NN spread). Rope points (classes 1+2+5): label %d, prediction %d, predicted "
+                "as rope but outside the label %d, in the label but not predicted %d. Harness, walk on r02's crop: ok %s, "
+                "length deviation from the episode median %s, crop coverage %s; walk on v035's saved crop: ok %s, length "
+                "deviation %s; v034 walk: length deviation %s." % (
+                    g("v034_status"), (h.get("v034_err", "") or "").replace("|", ", "), rl.sum(), rp.sum(), (rp & ~rl).sum(),
+                    (rl & ~rp).sum(), g("r02_ok"), g("r02_len_dev"), g("r02_coverage"), g("v035t_ok"), g("v035t_len_dev"),
+                    g("v034_len_dev")))
+        outs.append(publish(src, run, 8, "d003_loop_%s_f%06d" % (st["ep"], st["frame"]),
+                            "v036 PointNet++ %s on a d003 loop frame: %s frame %d, v034-derived label vs prediction"
+                            % (run, st["ep"], st["frame"]), body))
+    return outs
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["curves"] and len(sys.argv) > 2:
         print(chart_curves(sys.argv[2]))
+    elif sys.argv[1:2] == ["grip_overlap"]:
+        print("\n".join(grip_overlap()))
+    elif sys.argv[1:2] == ["loop_case"]:
+        print("\n".join(loop_case()))
     else:
         sys.exit(__doc__)

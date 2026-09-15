@@ -51,6 +51,8 @@ def pick_frames(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--n_per_obj", type=int, default=N_PER_OBJ)
+    ap.add_argument("--frames", default="", help="CSV with episode, frame columns instead of the default pick (any "
+                    "v034 frame, e.g. flagged ones; labels then come from that frame's own v034 node path)")
     ap.add_argument("--out_dir", default=OUT_DIR)
     ap.add_argument("--clean", default="false")
     args = ap.parse_args()
@@ -63,7 +65,12 @@ def main():
     radii = B.label_radii()
     mounts = B.drive_pool.all_mounts()
     stats = []
-    for batch, ep, fr in pick_frames(args.n_per_obj):
+    if args.frames:
+        with open(args.frames) as f:
+            todo = [(r["episode"].split("_", 1)[1], r["episode"], int(r["frame"])) for r in csv.DictReader(f)]
+    else:
+        todo = pick_frames(args.n_per_obj)
+    for batch, ep, fr in todo:
         od = os.path.join(B.GT_DIR, batch, ep, "_out_" + B.OUT_VER)
         raw_dir = B.resolve_raw(mounts, batch, ep)
         cfg = S7.load_cfg(od, raw_dir)

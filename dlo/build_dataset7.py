@@ -1,15 +1,20 @@
 #!/usr/bin/env python3.8
 # -*- coding: utf-8 -*-
 """
-build_dataset7.py -- 7-class scene-segmentation dataset (run r02) from raw L515 frames and v034 GT.
+build_dataset7.py -- 7-class scene-segmentation dataset (runs r02, r03) from raw L515 frames and v034 GT.
 
 Classes, labelled from geometry and pipeline regions (colour only where the pipeline's own region
-test uses it: the red finger and the red cloth):
+test uses it: the red finger and the red cloth; r03 adds the gripper body's cyan/blue for d001-d003):
   0 other / background
   1 rope body          within eps of the v034 node path (ends cut), not class 2 or 5
   2 rope gripper end   rope points in the last END_M (arc length) of the node path, gripper side
-  3 gripper            non-rope points in the FK gripper capsule (gripper_fk_capsule) or red points
-                       near the FK marker (remove_gripper_red_finger: the red right finger)
+  3 gripper            --grip_mode body (r03): non-rope points within GRIP_R_M of the frame's detected
+                       marker (lee_cam_x/y/z of run_frame_log.csv) that are saturated cyan/blue (hue
+                       GRIP_HUE, saturation > GRIP_S_MIN; d001-d003 only, d004's cable is blue), or in
+                       the gripper's static voxels in the marker frame (v035 gripper_static_voxels,
+                       FK orientation; all ropes), or red within gripper_red_excl_radius (the right
+                       finger). --grip_mode fk (r02): non-rope points in the FK gripper capsule
+                       (gripper_fk_capsule) or red near the FK marker (remove_gripper_red_finger)
   4 pole and mount     non-rope points in the fitted shaft capsule (fit_pole_shaft + remove_pole_shaft;
                        an episode whose own fit fails gets the batch's median slopes, radius and z range,
                        placed at its own pole marker minus the batch's median marker-to-axis offset)
@@ -20,24 +25,27 @@ test uses it: the red finger and the red cloth):
   5 rope pole end      rope points in the first END_M of the node path, pole side
   6 table / red cloth  red points in the pole-bottom box (remove_set_polbott, red-only) or points
                        within TABLE_BAND_M of the episode's table plane
-Precedence: rope (1, 2, 5) > gripper (3) > table/cloth (6) > pole (4) > other (0).
-eps = rope radius + 3 mm (build_dataset.label_radii). Pipeline functions are imported read only
-(dlo_perception_v034, v035) and applied with an index column appended, so each mask is exactly the
-set of points that function drops; nothing is written outside data/seg7/.
+Precedence: rope (1, 2, 5) > gripper (3) > table/cloth (6) > pole (4) > other (0). The rope classes
+come from the node path before any gripper region, so the rope's gripper end stays rope (class 2)
+where it touches the left finger. eps = rope radius + 3 mm (build_dataset.label_radii). Pipeline
+functions are imported read only (dlo_perception_v034, v035) and applied with an index column
+appended, so each mask is exactly the set of points that function drops; nothing is written outside
+data/seg7/ and ../split_seg7.json.
 
 Frames: N_FRAMES clean frames per episode (fit and hold-out, eqm_split as build_dataset.py), evenly
 spread; a frame failing the crop guard is replaced by the nearest passing clean frame. Crop guard =
 share of v034 crop points > CROP_FAR_M from the node path must be <= CROP_FAR_FRAC, measured over
-  --guard_mode v034       the whole crop (as specified; rejects ~99% of v034 clean frames, since the
-                          v034 crop still holds the pole-top assembly)
+  --guard_mode v034       the whole crop (rejects ~70% of v034 clean frames, since the v034 crop
+                          still holds the pole-top assembly)
   --guard_mode explained  crop points outside the pole / gripper / table regions above (what v035
-                          has already removed when its own guard runs); the r02 default
-Hold-out also gets the 12 flagged frames of data/index.csv. Per episode, once: shaft fit, static
-voxels and table plane from STATIC_FRAMES raw frames spread over the episode.
-Writes data/seg7/{frames,flagged,records}/, data/seg7/index.csv, data/seg7/meta.json (git-ignored).
+                          has already removed when its own guard runs); the default
+Hold-out also gets the 12 flagged frames of data/index.csv. Per episode, once: shaft fit (pre-pass,
+all episodes), static voxels, gripper static voxels and table plane from STATIC_FRAMES raw frames.
+Output only into an empty dir (general_rules §4): --clean true deletes the previous build first.
+Writes data/seg7/{frames,flagged,records}/, index.csv, meta.json, table_planes.csv, shaft_fits.json.
   dgx: docker run --rm --user 1000:1000 -e HOME=/home/smerx -v /home/smerx:/home/smerx \
          -v /media/smerx:/media/smerx:rslave -w ~/git/pointnetpp dlo_melodic \
-         python3.8 dlo/build_dataset7.py [--max_eps N] [--jobs 6] [--guard_mode v034|explained]
+         python3.8 dlo/build_dataset7.py [--max_eps N] [--jobs 6] [--grip_mode body|fk] [--clean true]
 Platforms: u18_a64 (dlo_melodic container on the dgx).
 """
 import argparse
@@ -57,18 +65,24 @@ END_M = 0.05                 # tied end length (arc length along the node path) 
 CROP_FAR_M = 0.05            # crop guard: a crop point this far from the node path is not rope
 CROP_FAR_FRAC = 0.20         # ... more than this share of such points: frame excluded
 GUARD_MODE = "explained"     # r02 default (smerx 2026-09-14); "v034" = whole crop (see docstring)
+GRIP_MODE = "body"           # r03 (smerx 2026-09-15): whole gripper at the detected marker; "fk" = r02's FK capsule
+GRIP_R_M = 0.10              # gripper body: within this of the detected marker (gt_ablation_v036 grip_color_rule.py)
+GRIP_HUE = (180, 225)        # ... saturated cyan/blue, hue range (0-359) ...
+GRIP_S_MIN = 50              # ... and saturation above this (0-99); d001-d003 only
 TABLE_NEAR_Z = (0.10, 0.03)  # table_planes.csv flags planes within 0.03 m of z = 0.10 m
 GUARD_SEARCH = 15            # candidate frames tried either side of a rejected one
 MOUNT_BOX = (-0.08, 0.08, -0.03, 0.12, -0.10, 0.10)   # dx, dy, dz around the pole marker: pole mount region
 TABLE_BAND_M = 0.015         # table surface = within this of the episode's table plane
 TABLE_SEARCH_Z = (-0.10, 0.15)   # table plane = densest 1 cm z-bin in this range (in-box points)
-STATIC_FRAMES = 20           # raw frames per episode for the static map and the table plane
+STATIC_FRAMES = 20           # raw frames per episode for the static maps and the table plane
 JOBS = 6
 MAX_EPS = 0                  # 0 = every episode; >0 = first N per batch and part (smoke runs)
-# v035 Config defaults for static_voxels() (dlo_perception_v035.py:452-453, 617-627); v034 configs lack them
-V035_POLE_TOP = dict(pole_top_static_box_pad=[0.10, 0.35, 0.02, 0.15, 0.61, 0.10], pole_top_static_voxel_m=0.008,
+# v035 Config defaults (dlo_perception_v035.py:436-442, 452-453, 617-627); v034 configs lack them
+V035_DEFAULTS = dict(pole_top_static_box_pad=[0.10, 0.35, 0.02, 0.15, 0.61, 0.10], pole_top_static_voxel_m=0.008,
                      pole_top_static_frac=0.5, pole_top_static_frames=STATIC_FRAMES, pole_top_static_dilate=1,
-                     pole_top_static_low_z=0.16, pole_top_static_low_frac=0.2)
+                     pole_top_static_low_z=0.16, pole_top_static_low_frac=0.2,
+                     gripper_static_r_m=0.10, gripper_static_voxel_m=0.008, gripper_static_frac=0.5,
+                     gripper_static_dilate=1)
 CLASSES = ("other", "rope body", "rope gripper end", "gripper", "pole and mount", "rope pole end", "table / red cloth")
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "data", "seg7")
@@ -80,7 +94,7 @@ if B.platform_id() not in PLATFORMS:
     sys.exit("refusing to run %s: written for %s, this is %s" % (os.path.basename(__file__), PLATFORMS, B.platform_id()))
 import numpy as np            # noqa: E402
 with contextlib.redirect_stdout(io.StringIO()):
-    import dlo_perception_v035 as M    # noqa: E402  static_voxels, pole_top_box, _points_to_polyline (read only)
+    import dlo_perception_v035 as M    # noqa: E402  static_voxels, gripper_static_voxels, _quat_R, ... (read only)
 P, D = B.P, B.D
 
 
@@ -103,7 +117,7 @@ def load_cfg(od, raw_dir):
                 pass
         setattr(c, k, v)
     c.in_pcd_dir = raw_dir
-    for k, v in V035_POLE_TOP.items():
+    for k, v in V035_DEFAULTS.items():
         setattr(c, k, np.asarray(v, dtype=float) if isinstance(v, list) else v)
     return c
 
@@ -122,6 +136,12 @@ def frame_df(od, frame):
         df.pole_pose = pp[:3] if pp is not None and pp.size >= 3 else np.full(3, np.nan)
         df.lee_lrbox, df.pole_prbox = arr(fd.get("lee_lrbox")), arr(fd.get("pole_prbox"))
     return df
+
+
+def fk_quat(df):
+    """The FK gripper orientation (lee_pose_rob[3:7], qx qy qz qw), or None."""
+    q = df.lee_pose_rob
+    return q[3:7] if q is not None and q.size == 7 and np.isfinite(q[3:7]).all() else None
 
 
 def hsv_mask(rgb01, lo, hi):
@@ -175,18 +195,45 @@ def removed_by(fn, x6, *args):
     return m
 
 
-def region_masks(x6, df, cfg, eps, static, table_z):
-    """Non-rope region masks for xyz + rgb01 rows: FK capsule, red finger, red cloth, table band,
-    shaft capsule, static mount voxels."""
+def grip_masks(x6, marker, quat, grip_static, cfg):
+    """r03 gripper body around the frame's detected marker: saturated cyan/blue (d001-d003 only), static
+    voxels in the marker frame (v035 gripper_static_voxels; all ropes), red (the right finger)."""
+    n = len(x6)
+    out = {"grip_col": np.zeros(n, bool), "grip_static": np.zeros(n, bool), "grip_red": np.zeros(n, bool)}
+    if marker is None or not np.isfinite(marker).all():
+        return out
+    d = np.linalg.norm(x6[:, :3] - marker, axis=1)
+    w = np.where(d < GRIP_R_M)[0]
+    if not len(w):
+        return out
+    if int(cfg.dlo_no) != 4:
+        hsv = P.get_rgb2hsv_set(x6[w, 3:6]) * np.array([359, 99, 99])
+        out["grip_col"][w] = (hsv[:, 0] >= GRIP_HUE[0]) & (hsv[:, 0] <= GRIP_HUE[1]) & (hsv[:, 1] > GRIP_S_MIN)
+    out["grip_red"][w] = is_red(x6[w, 3:6], cfg) & (d[w] <= cfg.gripper_red_excl_radius)
+    if grip_static and quat is not None:
+        keys = np.floor(((x6[w, :3] - marker) @ M._quat_R(quat)) / cfg.gripper_static_voxel_m).astype(np.int64)
+        out["grip_static"][w] = np.fromiter((tuple(k) in grip_static for k in keys), dtype=bool, count=len(w))
+    return out
+
+
+def region_masks(x6, df, cfg, eps, static, table_z, grip=None):
+    """Non-rope region masks for xyz + rgb01 rows: gripper (FK capsule + red finger for r02, or r03's
+    grip_masks when grip = (marker, quat, gripper static voxels)), red cloth, table band, shaft capsule and
+    its base, static mount voxels."""
     xyz, n = x6[:, :3], len(x6)
     z = lambda: np.zeros(n, bool)
-    caps = P.gripper_fk_capsule(df, cfg) if df.lee_pose_rob is not None and df.lee_pose_rob.size == 7 else None
-    m = {"caps": P._points_in_capsule_mask(xyz, *caps) if caps is not None else z(),
-         "red_finger": removed_by(P.remove_gripper_red_finger, x6, df, cfg) if caps is not None else z(),
-         "cloth": removed_by(P.remove_set_polbott, x6, cfg),
-         "band": np.abs(xyz[:, 2] - table_z) <= TABLE_BAND_M if table_z is not None else z(),
-         "shaft": removed_by(P.remove_pole_shaft, x6, df, cfg, eps) if eps.pole_shaft is not None else z(),
-         "shaft_base": z(), "stat": z()}
+    m = {"caps": z(), "red_finger": z(), "grip_col": z(), "grip_static": z(), "grip_red": z()}
+    if grip is not None:
+        m.update(grip_masks(x6, grip[0], grip[1], grip[2], cfg))
+    else:
+        caps = P.gripper_fk_capsule(df, cfg) if df.lee_pose_rob is not None and df.lee_pose_rob.size == 7 else None
+        if caps is not None:
+            m["caps"] = P._points_in_capsule_mask(xyz, *caps)
+            m["red_finger"] = removed_by(P.remove_gripper_red_finger, x6, df, cfg)
+    m.update({"cloth": removed_by(P.remove_set_polbott, x6, cfg),
+              "band": np.abs(xyz[:, 2] - table_z) <= TABLE_BAND_M if table_z is not None else z(),
+              "shaft": removed_by(P.remove_pole_shaft, x6, df, cfg, eps) if eps.pole_shaft is not None else z(),
+              "shaft_base": z(), "stat": z()})
     sh = eps.pole_shaft
     if sh is not None and table_z is not None and table_z < sh["z_lo"]:
         # the shaft fit starts at z 0.16 m: its axis, extended down to the table plane, same radius + margin
@@ -203,7 +250,10 @@ def region_masks(x6, df, cfg, eps, static, table_z):
     return m
 
 
-def crop_far_shares(od, frame, cfg, eps, static, table_z):
+GRIP_KEYS = ("caps", "red_finger", "grip_col", "grip_static", "grip_red")
+
+
+def crop_far_shares(od, frame, cfg, eps, static, table_z, grip=None):
     """(far share of the whole v034 crop, far share of the crop points outside the pole/gripper/table regions)."""
     c = D.frame_file(od, "dlo_raw_crop_pcd", frame, "pcd")
     k = D.frame_file(od, "dlo_nodes_pcd", frame, "pcd")
@@ -214,23 +264,36 @@ def crop_far_shares(od, frame, cfg, eps, static, table_z):
     if len(crop) == 0 or len(nodes) < 2:
         return np.nan, np.nan
     far = M._points_to_polyline(crop[:, :3], nodes) > CROP_FAR_M
-    rm = region_masks(crop, frame_df(od, frame), cfg, eps, static, table_z)
-    explained = rm["caps"] | rm["red_finger"] | rm["cloth"] | rm["band"] | rm["shaft"] | rm["shaft_base"] | rm["stat"]
+    rm = region_masks(crop, frame_df(od, frame), cfg, eps, static, table_z, grip)
+    explained = rm["cloth"] | rm["band"] | rm["shaft"] | rm["shaft_base"] | rm["stat"]
+    for g in GRIP_KEYS:
+        explained |= rm[g]
     return float(far.mean()), float((far & ~explained).mean())
 
 
-def episode_maps(cfg, fnames, box, shaft=None):
-    """Shaft (the pre-pass fit or its batch fallback, see main), pole-top static voxels (v035
-    static_voxels) and table plane z."""
+def episode_maps(cfg, fnames, box, shaft=None, od=None, lee=None):
+    """Shaft (the pre-pass fit or its batch fallback, see main), pole-top static voxels (v035 static_voxels),
+    table plane z and, for --grip_mode body, the gripper's static voxels in the marker frame (v035
+    gripper_static_voxels: detected marker lee_cam, FK orientation)."""
     eps = _NS()
     eps.pcd_fnames, eps.pole_shaft, eps.pole_pose_calib = fnames, shaft, None
     n = len(fnames)
+    idx = np.unique(np.linspace(0, n - 1, min(STATIC_FRAMES, n)).astype(int))
     clouds = []
-    for i in np.unique(np.linspace(0, n - 1, min(STATIC_FRAMES, n)).astype(int)):
+    for i in idx:
         with quiet():
             clouds.append(P.transform_xyz_rgb(P.load_point_cloud_with_rgb(os.path.join(cfg.in_pcd_dir, fnames[i])), cfg)[:, :3])
     with quiet():
         static = M.static_voxels(clouds, cfg)
+    grip_static = None
+    if GRIP_MODE == "body" and od is not None and lee is not None:
+        mks = [lee.get(int(i) + 1, np.full(3, np.nan)) for i in idx]
+        qs = []
+        for i in idx:
+            q = fk_quat(frame_df(od, int(i) + 1))
+            qs.append(q if q is not None else np.full(4, np.nan))
+        with quiet():
+            grip_static = M.gripper_static_voxels(clouds, mks, qs, cfg)
     z = np.concatenate([c[B.in_box(c, box), 2] for c in clouds])
     z = z[(z > TABLE_SEARCH_Z[0]) & (z < TABLE_SEARCH_Z[1])]
     table_z = None
@@ -238,7 +301,7 @@ def episode_maps(cfg, fnames, box, shaft=None):
         h, e = np.histogram(z, bins=np.arange(TABLE_SEARCH_Z[0], TABLE_SEARCH_Z[1] + 1e-9, 0.01))
         c0 = e[np.argmax(h)] + 0.005
         table_z = float(np.median(z[np.abs(z - c0) <= 0.01]))
-    return eps, static, table_z
+    return eps, static, table_z, grip_static
 
 
 def shaft_job(task):
@@ -302,7 +365,13 @@ def batch_fallback(fits, markers):
     return out, spread
 
 
-def build_frame7(od, raw_dir, raw_name, frame, cfg, eps, static, table_z, box, eps_m, out_path):
+def episode_lee(fl):
+    """{frame: detected gripper marker xyz} from run_frame_log.csv (lee_cam_x/y/z)."""
+    f, x, y, z = fl.frame_no(), fl.col("lee_cam_x"), fl.col("lee_cam_y"), fl.col("lee_cam_z")
+    return {int(a): np.array([b, c, d]) for a, b, c, d in zip(f, x, y, z) if np.isfinite([a, b, c, d]).all()}
+
+
+def build_frame7(od, raw_dir, raw_name, frame, cfg, eps, static, table_z, box, eps_m, out_path, grip_static=None, lee=None):
     """Load, transform, crop to the box, label 7 classes, save; return the stats row."""
     crop_path = D.frame_file(od, "dlo_raw_crop_pcd", frame, "pcd")
     nodes_path = D.frame_file(od, "dlo_nodes_pcd", frame, "pcd")
@@ -315,7 +384,9 @@ def build_frame7(od, raw_dir, raw_name, frame, cfg, eps, static, table_z, box, e
     xyz, rgb = xb[:, :3], xb[:, 3:6]
     df = frame_df(od, frame)
     n = len(xb)
-    row = {"frame": frame, "npz": out_path, "has_nodes": nodes_path is not None, "n_box": n, "table_z": table_z}
+    marker = (lee or {}).get(frame)
+    row = {"frame": frame, "npz": out_path, "has_nodes": nodes_path is not None, "n_box": n, "table_z": table_z,
+           "grip_mode": GRIP_MODE, "marker": None if marker is None else np.round(marker, 4).tolist()}
 
     rope, s, L = np.zeros(n, bool), np.full(n, np.nan), np.nan
     if nodes_path is not None:
@@ -324,8 +395,12 @@ def build_frame7(od, raw_dir, raw_name, frame, cfg, eps, static, table_z, box, e
         rope, s, L = rope_arclen(xyz, nodes, eps_m)
     pole_end = rope & (s <= END_M)
     grip_end = rope & (s >= L - END_M) & ~pole_end
-    rm = region_masks(xb, df, cfg, eps, static, table_z)
-    grip = ~rope & (rm["caps"] | rm["red_finger"])
+    grip_ctx = (marker, fk_quat(df), grip_static) if GRIP_MODE == "body" else None
+    rm = region_masks(xb, df, cfg, eps, static, table_z, grip_ctx)
+    grip_region = np.zeros(n, bool)
+    for g in GRIP_KEYS:
+        grip_region |= rm[g]
+    grip = ~rope & grip_region                          # rope (node path) first: the tied end stays rope
     table = ~rope & ~grip & (rm["cloth"] | rm["band"])
     pole = ~rope & ~grip & ~table & (rm["shaft"] | rm["shaft_base"] | rm["stat"])
 
@@ -338,13 +413,17 @@ def build_frame7(od, raw_dir, raw_name, frame, cfg, eps, static, table_z, box, e
     lab[pole] = 4
     for c in range(7):
         row["n_c%d" % c] = int((lab == c).sum())
-    # sanity checks: where the geometric end classes sit, and what colour confirms
-    row["c2_in_caps_or_lrbox"] = int(((lab == 2) & (rm["caps"] | in_box6(xyz, df.lee_lrbox))).sum())
+    # sanity checks: where the geometric end classes sit, what colour confirms, what each gripper rule adds
+    row["c2_in_caps_or_lrbox"] = int(((lab == 2) & (grip_region | in_box6(xyz, df.lee_lrbox))).sum())
+    row["c2_in_grip_region"] = int(((lab == 2) & grip_region).sum())     # rope end kept as rope inside the gripper region
     row["c5_in_prbox"] = int(((lab == 5) & in_box6(xyz, df.pole_prbox)).sum())
     row["c2_green"] = int(hsv_mask(rgb[lab == 2], cfg.hsv_green_min, cfg.hsv_green_max).sum()) if (lab == 2).any() else 0
     row["c5_red"] = int(is_red(rgb[lab == 5], cfg).sum()) if (lab == 5).any() else 0
     row["c4_blue"] = int(hsv_mask(rgb[lab == 4], cfg.hsv_blue_min, cfg.hsv_blue_max).sum()) if (lab == 4).any() else 0
-    row["c3_red_finger"] = int((grip & rm["red_finger"] & ~rm["caps"]).sum())
+    row["c3_red_finger"] = int((grip & (rm["red_finger"] | rm["grip_red"]) & ~rm["caps"]).sum())
+    row["c3_col"] = int((grip & rm["grip_col"]).sum())
+    row["c3_static"] = int((grip & rm["grip_static"]).sum())
+    row["c3_static_only"] = int((grip & rm["grip_static"] & ~rm["grip_col"] & ~rm["grip_red"]).sum())
     row["c6_cloth_red"] = int((table & rm["cloth"]).sum())
     row["path_len_m"] = L
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -356,20 +435,19 @@ def build_frame7(od, raw_dir, raw_name, frame, cfg, eps, static, table_z, box, e
 def episode_job(task):
     batch, ep, split, box, eps_m, raw_dir, out_dir, flagged, guard_mode, shaft = task
     rec_path = os.path.join(out_dir, "records", ep + ".json")
-    if os.path.isfile(rec_path):
-        with open(rec_path) as f:
-            return json.load(f)
     t0 = time.time()
     od = os.path.join(B.GT_DIR, batch, ep, "_out_" + B.OUT_VER)
     fl = D.read_frame_log(od)
     fno = fl.frame_no().astype(int)
     status = np.array([s.strip().upper() for s in fl.text("status")])
     clean = fl.clean & ~fl.has_warn & (status == "PASS")
+    lee = episode_lee(fl)
     on_disk = set(D.frames_on_disk(od, "dlo_nodes_pcd")) & set(D.frames_on_disk(od, "dlo_raw_crop_pcd"))
     with open(os.path.join(od, "eps_data", "pcd_fnames.txt")) as f:
         fnames = f.read().split()
     cfg = load_cfg(od, raw_dir)
-    eps, static, table_z = episode_maps(cfg, fnames, box, shaft)
+    eps, static, table_z, grip_static = episode_maps(cfg, fnames, box, shaft, od, lee)
+    gctx = lambda fr: (lee.get(fr), fk_quat(frame_df(od, fr)), grip_static) if GRIP_MODE == "body" else None
     cand = [int(f) for f in fno[clean] if f in on_disk]
     targets = np.unique(np.round(np.linspace(0, len(cand) - 1, N_FRAMES)).astype(int))
     used, picks, n_checked, n_fail, n_repl, n_unfilled = set(), [], 0, 0, 0, 0
@@ -380,7 +458,7 @@ def episode_job(task):
             j = ti + off
             if j < 0 or j >= len(cand) or cand[j] in used:
                 continue
-            far_all, far_unexpl = crop_far_shares(od, cand[j], cfg, eps, static, table_z)
+            far_all, far_unexpl = crop_far_shares(od, cand[j], cfg, eps, static, table_z, gctx(cand[j]))
             far = far_all if guard_mode == "v034" else far_unexpl
             n_checked += 1
             n_fail_mode["v034"] += int(not (np.isfinite(far_all) and far_all <= CROP_FAR_FRAC))
@@ -398,14 +476,14 @@ def episode_job(task):
     rows = []
     for fr, far_all, far_unexpl, repl in picks:
         out_path = os.path.join(out_dir, "frames", batch, ep, "%s_f%06d.npz" % (ep, fr))
-        r = build_frame7(od, raw_dir, fnames[fr - 1], fr, cfg, eps, static, table_z, box, eps_m, out_path)
+        r = build_frame7(od, raw_dir, fnames[fr - 1], fr, cfg, eps, static, table_z, box, eps_m, out_path, grip_static, lee)
         r.update(batch=batch, ep=ep, split=split, kind="clean", status="PASS", tags="", crop_far=far_all,
                  crop_far_unexpl=far_unexpl, guard_repl=repl)
         rows.append(r)
     for fr, st, tags in flagged:
         out_path = os.path.join(out_dir, "flagged", "%s_f%06d.npz" % (ep, fr))
-        r = build_frame7(od, raw_dir, fnames[fr - 1], fr, cfg, eps, static, table_z, box, eps_m, out_path)
-        far_all, far_unexpl = crop_far_shares(od, fr, cfg, eps, static, table_z)
+        r = build_frame7(od, raw_dir, fnames[fr - 1], fr, cfg, eps, static, table_z, box, eps_m, out_path, grip_static, lee)
+        far_all, far_unexpl = crop_far_shares(od, fr, cfg, eps, static, table_z, gctx(fr))
         r.update(batch=batch, ep=ep, split=split, kind="flagged", status=st, tags=tags, crop_far=far_all,
                  crop_far_unexpl=far_unexpl, guard_repl=False)
         rows.append(r)
@@ -413,7 +491,8 @@ def episode_job(task):
     rec = {"batch": batch, "ep": ep, "split": split, "rows": rows, "n_cand": len(cand), "n_guard_checked": n_checked,
            "n_guard_fail": n_fail, "n_guard_fail_v034": n_fail_mode["v034"], "n_guard_fail_explained": n_fail_mode["explained"],
            "n_guard_replaced": n_repl, "n_unfilled": n_unfilled, "table_z": table_z,
-           "n_static_voxels": len(static) if static else 0, "guard_mode": guard_mode,
+           "n_static_voxels": len(static) if static else 0, "guard_mode": guard_mode, "grip_mode": GRIP_MODE,
+           "n_grip_static_voxels": len(grip_static) if grip_static else 0,
            "shaft": None if sh is None else {k: sh[k] for k in ("wx", "wy", "radius", "z_lo", "z_hi", "lean", "slices", "src")},
            "sec": time.time() - t0}
     os.makedirs(os.path.dirname(rec_path), exist_ok=True)
@@ -424,14 +503,17 @@ def episode_job(task):
 
 
 def main():
+    global GRIP_MODE
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--jobs", type=int, default=JOBS)
     ap.add_argument("--max_eps", type=int, default=MAX_EPS)
     ap.add_argument("--guard_mode", default=GUARD_MODE, choices=("v034", "explained"))
+    ap.add_argument("--grip_mode", default=GRIP_MODE, choices=("body", "fk"))
     ap.add_argument("--out_dir", default=OUT_DIR)
     ap.add_argument("--clean", default="false", help="true: delete a non-empty --out_dir first (general_rules §4: "
-                    "output only into an empty dir, so no dir mixes runs; deleting an old build needs smerx's approval)")
+                    "output only into an empty dir, so no dir mixes runs)")
     args = ap.parse_args()
+    GRIP_MODE = args.grip_mode           # read by the worker processes (fork) through the module global
     if os.path.isdir(args.out_dir) and os.listdir(args.out_dir):
         if args.clean != "true":
             sys.exit("refusing to write into non-empty %s (general_rules §4): pass --clean true to delete it first"
@@ -476,8 +558,9 @@ def main():
                    "batch_spread": spread}, f, indent=1, default=float)
     tasks = [(b, e, p, box, radii[b[:4]][0], raw[e], args.out_dir, flagged.get(e, []), args.guard_mode, shaft[e])
              for b, e, p in episodes]
-    print("episodes %d (fit %d, holdout %d), guard %s, jobs %d" % (
-        len(tasks), sum(t[2] == "fit" for t in tasks), sum(t[2] == "holdout" for t in tasks), args.guard_mode, args.jobs), flush=True)
+    print("episodes %d (fit %d, holdout %d), guard %s, gripper %s, jobs %d" % (
+        len(tasks), sum(t[2] == "fit" for t in tasks), sum(t[2] == "holdout" for t in tasks), args.guard_mode,
+        GRIP_MODE, args.jobs), flush=True)
     t0, recs = time.time(), []
     with Pool(args.jobs) as pool:
         for i, rec in enumerate(pool.imap_unordered(episode_job, tasks, chunksize=1)):
@@ -488,26 +571,26 @@ def main():
     rows = sorted((r for rec in recs for r in rec["rows"]), key=lambda r: (r["kind"], r["batch"], r["ep"], r["frame"]))
     cols = ["batch", "ep", "split", "kind", "frame", "status", "tags", "crop_far", "crop_far_unexpl", "guard_repl", "table_z",
             "path_len_m", "n_box"] + ["n_c%d" % c for c in range(7)] + [
-            "c2_in_caps_or_lrbox", "c5_in_prbox", "c2_green", "c5_red", "c4_blue", "c3_red_finger", "c6_cloth_red",
-            "has_nodes", "npz"]
+            "c2_in_caps_or_lrbox", "c2_in_grip_region", "c5_in_prbox", "c2_green", "c5_red", "c4_blue", "c3_red_finger",
+            "c3_col", "c3_static", "c3_static_only", "c6_cloth_red", "grip_mode", "marker", "has_nodes", "npz"]
     with open(os.path.join(args.out_dir, "index.csv"), "w") as f:
         w = csv.writer(f)
         w.writerow(cols)
         for r in rows:
             w.writerow([os.path.relpath(r[c], args.out_dir) if c == "npz" else r[c] for c in cols])
 
-    # one row per episode: its table plane, static map, shaft fit and guard counts
+    # one row per episode: its table plane, static maps, shaft fit and guard counts
     near = lambda z: z is not None and abs(z - TABLE_NEAR_Z[0]) <= TABLE_NEAR_Z[1]
     with open(os.path.join(args.out_dir, "table_planes.csv"), "w") as f:
         w = csv.writer(f)
-        w.writerow(["batch", "ep", "split", "table_z_m", "near_0.10_m", "n_static_voxels", "shaft_fit", "shaft_src",
-                    "shaft_radius_m", "shaft_z_lo_m", "shaft_z_hi_m", "frames", "guard_checked", "guard_fail_explained",
-                    "guard_fail_v034", "guard_replaced"])
+        w.writerow(["batch", "ep", "split", "table_z_m", "near_0.10_m", "n_static_voxels", "n_grip_static_voxels", "shaft_fit",
+                    "shaft_src", "shaft_radius_m", "shaft_z_lo_m", "shaft_z_hi_m", "frames", "guard_checked",
+                    "guard_fail_explained", "guard_fail_v034", "guard_replaced"])
         for rec in sorted(recs, key=lambda r: (r["batch"], r["ep"])):
             sh = rec["shaft"] or {}
             w.writerow([rec["batch"], rec["ep"], rec["split"], "" if rec["table_z"] is None else round(rec["table_z"], 4),
-                        near(rec["table_z"]), rec["n_static_voxels"], sh.get("src") == "own fit", sh.get("src", "none"),
-                        round(sh.get("radius", np.nan), 4),
+                        near(rec["table_z"]), rec["n_static_voxels"], rec["n_grip_static_voxels"], sh.get("src") == "own fit",
+                        sh.get("src", "none"), round(sh.get("radius", np.nan), 4),
                         round(sh.get("z_lo", np.nan), 3), round(sh.get("z_hi", np.nan), 3),
                         sum(x["kind"] == "clean" for x in rec["rows"]), rec["n_guard_checked"],
                         rec["n_guard_fail_explained"], rec["n_guard_fail_v034"], rec["n_guard_replaced"]])
@@ -521,18 +604,24 @@ def main():
     fit = [r for r in clean if r["split"] == "fit"]
     f_fit = np.array(list(shares(fit).values())) if fit else np.full(7, np.nan)
     tz = [rec["table_z"] for rec in recs if rec["table_z"] is not None]
-    csum = lambda k: sum(r[k] for r in clean)
+    csum = lambda k, rr=None: sum(r[k] for r in (clean if rr is None else rr))
     q = lambda v: np.percentile(v, [5, 50, 95]).round(3).tolist() if len(v) else None
     meta = {"gt_version": B.OUT_VER, "classes": list(CLASSES), "box": box, "end_m": END_M, "mount_box": MOUNT_BOX,
             "table_band_m": TABLE_BAND_M,
+            "gripper": {"mode": GRIP_MODE, "r_m": GRIP_R_M, "hue": GRIP_HUE, "s_min": GRIP_S_MIN,
+                        "rule": ("detected marker (lee_cam) anchor; within %.2f m: cyan/blue (d001-d003) or gripper static "
+                                 "voxels (marker frame, FK orientation) or red within gripper_red_excl_radius; rope first"
+                                 % GRIP_R_M) if GRIP_MODE == "body" else "FK capsule + red near the FK marker (r02)",
+                        "by_object": {d: {k: csum(k, [r for r in clean if r["batch"].startswith(d)]) for k in
+                                          ("n_c3", "c3_col", "c3_static", "c3_static_only", "c3_red_finger", "n_c2", "c2_in_grip_region")}
+                                      for d in ("d001", "d002", "d003", "d004")}},
             "crop_guard": {"mode": args.guard_mode, "far_m": CROP_FAR_M, "far_frac": CROP_FAR_FRAC,
                            "checked": sum(r["n_guard_checked"] for r in recs), "failed": sum(r["n_guard_fail"] for r in recs),
                            "failed_if_v034_mode": sum(r["n_guard_fail_v034"] for r in recs),
                            "failed_if_explained_mode": sum(r["n_guard_fail_explained"] for r in recs),
-                           "explained_regions": "FK gripper capsule | red points within gripper_red_excl_radius of the "
-                                                "FK marker | red points in the pole-bottom box | table band +-%.3f m | "
+                           "explained_regions": "gripper (mode %s) | red points in the pole-bottom box | table band +-%.3f m | "
                                                 "pole-shaft capsule | shaft axis extended to the table plane | static "
-                                                "voxels in the mount box %s m around the pole marker" % (TABLE_BAND_M, MOUNT_BOX),
+                                                "voxels in the mount box %s m around the pole marker" % (GRIP_MODE, TABLE_BAND_M, MOUNT_BOX),
                            "replaced": sum(r["n_guard_replaced"] for r in recs), "unfilled": sum(r["n_unfilled"] for r in recs),
                            "kept_far_whole_crop_p05_p50_p95": q([r["crop_far"] for r in clean]),
                            "kept_far_unexplained_p05_p50_p95": q([r["crop_far_unexpl"] for r in clean])},
@@ -547,14 +636,16 @@ def main():
             "shaft_fallback": sum((rec["shaft"] or {}).get("src", "own fit") != "own fit" for rec in recs),
             "shaft_none": sum(rec["shaft"] is None for rec in recs), "shaft_batch_spread": spread,
             "static_voxels_median": float(np.median([r["n_static_voxels"] for r in recs])),
+            "grip_static_voxels_median": float(np.median([r["n_grip_static_voxels"] for r in recs])),
             "table_z": {"episodes_with_plane": len(tz), "median": float(np.median(tz)) if tz else None,
                         "p05_p95": np.percentile(tz, [5, 95]).round(3).tolist() if tz else None,
                         "near_0.10_m": sorted(r["ep"] for r in recs if near(r["table_z"]))},
-            "sanity": {"c2_in_fk_capsule_or_lrbox": csum("c2_in_caps_or_lrbox") / max(1, csum("n_c2")),
+            "sanity": {"c2_in_gripper_region_or_lrbox": csum("c2_in_caps_or_lrbox") / max(1, csum("n_c2")),
+                       "c2_kept_as_rope_in_gripper_region": csum("c2_in_grip_region") / max(1, csum("n_c2")),
                        "c5_in_pole_prbox": csum("c5_in_prbox") / max(1, csum("n_c5")),
                        "c2_green": csum("c2_green") / max(1, csum("n_c2")), "c5_red": csum("c5_red") / max(1, csum("n_c5")),
                        "c4_blue": csum("c4_blue") / max(1, csum("n_c4")),
-                       "c3_red_finger_outside_capsule": csum("c3_red_finger") / max(1, csum("n_c3")),
+                       "c3_red_finger": csum("c3_red_finger") / max(1, csum("n_c3")),
                        "c6_red_cloth": csum("c6_cloth_red") / max(1, csum("n_c6"))},
             "build_sec": time.time() - t0}
     with open(os.path.join(args.out_dir, "meta.json"), "w") as f:
