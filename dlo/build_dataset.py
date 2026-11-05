@@ -51,28 +51,6 @@ MAX_EPS = 0                 # 0 = every episode; >0 = first N per batch (smoke r
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "data")
 
-PLATFORMS = ("u18_a64",)
-
-
-def platform_id():
-    """u<Ubuntu major>_<x86|a64>, as ~/git/bashrc/platform.sh computes it."""
-    osr = {}
-    try:
-        with open("/etc/os-release") as f:
-            for line in f:
-                k, _, v = line.strip().partition("=")
-                osr[k] = v.strip('"')
-    except OSError:
-        pass
-    os_id = "u" if osr.get("ID") == "ubuntu" else osr.get("ID", "linux")
-    arch = {"x86_64": "x86", "aarch64": "a64"}.get(os.uname()[4], os.uname()[4])
-    return "%s%s_%s" % (os_id, osr.get("VERSION_ID", "").split(".")[0], arch)
-
-
-if platform_id() not in PLATFORMS:
-    sys.stderr.write("refusing to run %s: written for %s, but %s is %s\n" % (
-        os.path.basename(__file__), " ".join(PLATFORMS), os.uname()[1], platform_id()))
-    sys.exit(3)
 
 sys.path[:0] = [DEV_DIR, os.path.join(DEV_DIR, "studies"), os.path.join(DEV_DIR, "eval_qm")]
 # one BLAS thread per worker: JOBS processes, not JOBS x 20 threads, on a shared host

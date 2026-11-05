@@ -87,11 +87,8 @@ CLASSES = ("other", "rope body", "rope gripper end", "gripper", "pole and mount"
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "data", "seg7")
 
-PLATFORMS = ("u18_a64",)
 sys.path.insert(0, HERE)
 import build_dataset as B     # noqa: E402  its own guard (u18_a64), split, raw loading, radii, box, drive pool
-if B.platform_id() not in PLATFORMS:
-    sys.exit("refusing to run %s: written for %s, this is %s" % (os.path.basename(__file__), PLATFORMS, B.platform_id()))
 import numpy as np            # noqa: E402
 with contextlib.redirect_stdout(io.StringIO()):
     import dlo_perception_v035 as M    # noqa: E402  static_voxels, gripper_static_voxels, _quat_R, ... (read only)

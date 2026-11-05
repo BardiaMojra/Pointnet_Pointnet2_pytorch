@@ -19,8 +19,6 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import platform_guard                                                        # noqa: E402
-platform_guard.require(("u24_a64",), __file__)
 
 import glob                                                                  # noqa: E402
 import hashlib                                                               # noqa: E402
